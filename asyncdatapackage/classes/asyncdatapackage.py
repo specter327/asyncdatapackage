@@ -1,78 +1,192 @@
+"""
+AsyncDataPackage
+
+Generic async message framing library.
+
+Features:
+- asyncio native
+- JSON messages
+- Delimiter-based framing
+- Bounded queue
+- Configurable backpressure
+- Graceful shutdown
+- Stream agnostic
+- Reactive callbacks
+
+Author:
+    Specter327
+
+License:
+    MIT
+"""
+
+from __future__ import annotations
+
 import asyncio
 import json
-import traceback
+import logging
 
-from typing import Optional
+from typing import (
+    Awaitable,
+    Callable,
+    Optional
+)
+
+logger = logging.getLogger(__name__)
+
+
+class AsyncDataPackageError(Exception):
+    pass
+
+
+class AsyncDataPackageStateError(
+    AsyncDataPackageError
+):
+    pass
 
 
 class AsyncDataPackage:
 
-    PACKAGE_DELIMITER = b"\x01\x02\x03\x01\x01\x01"
+    DEFAULT_DELIMITER = (
+        b"\x01\x02\x03\x01\x01\x01"
+    )
 
     def __init__(
         self,
-        write_function,
-        read_function,
-        read_arguments=None,
-        read_keyword_arguments=None,
-        write_arguments=None,
-        write_keyword_arguments=None
+        *,
+        write_function: Callable[
+            ...,
+            Awaitable[bool]
+        ],
+        read_function: Callable[
+            ...,
+            Awaitable[bytes]
+        ],
+        read_arguments: tuple = (),
+        read_keyword_arguments: Optional[
+            dict
+        ] = None,
+        write_arguments: tuple = (),
+        write_keyword_arguments: Optional[
+            dict
+        ] = None,
+        delimiter: bytes = (
+            DEFAULT_DELIMITER
+        ),
+        max_queue_size: int = 1000,
+        max_buffer_size: int = (
+            10 * 1024 * 1024
+        ),
+        backpressure_mode: str = (
+            "block"
+        )
     ):
 
-        self._write_function = write_function
-        self._read_function = read_function
+        if max_queue_size < 1:
+
+            raise ValueError(
+                "max_queue_size "
+                "must be >= 1"
+            )
+
+        if max_buffer_size < 1024:
+
+            raise ValueError(
+                "max_buffer_size "
+                "too small"
+            )
+
+        if backpressure_mode not in (
+            "block",
+            "drop",
+            "drop_oldest"
+        ):
+
+            raise ValueError(
+                f"Invalid "
+                f"backpressure mode: "
+                f"{backpressure_mode}"
+            )
+
+        self._write_function = (
+            write_function
+        )
+
+        self._read_function = (
+            read_function
+        )
 
         self._read_arguments = (
             read_arguments
-            if read_arguments
-            else ()
         )
 
-        self._read_keyword_arguments = (
+        self._read_kwargs = (
             read_keyword_arguments
-            if read_keyword_arguments
-            else {}
+            or {}
         )
 
         self._write_arguments = (
             write_arguments
-            if write_arguments
-            else ()
         )
 
-        self._write_keyword_arguments = (
+        self._write_kwargs = (
             write_keyword_arguments
-            if write_keyword_arguments
-            else {}
+            or {}
         )
 
-        self._package_queue = asyncio.Queue()
+        self._delimiter = delimiter
 
-        self._reception_buffer = b""
+        self._queue = (
+            asyncio.Queue(
+                maxsize=max_queue_size
+            )
+        )
+
+        self._max_buffer_size = (
+            max_buffer_size
+        )
+
+        self._backpressure_mode = (
+            backpressure_mode
+        )
+
+        self._buffer = bytearray()
 
         self._running = False
-        self._reader_task = None
 
-        self._lock = asyncio.Lock()
+        self._reader_task: Optional[
+            asyncio.Task
+        ] = None
 
-    # =====================================================
-    # START / STOP
-    # =====================================================
+        self._datapackage_callbacks = []
 
-    async def start(self):
+    # -------------------------------------------------
+    # Lifecycle
+    # -------------------------------------------------
+
+    async def start(
+        self
+    ) -> bool:
 
         if self._running:
             return True
 
         self._running = True
 
-        self._reader_task = asyncio.create_task(
-            self._reader_loop()
+        self._reader_task = (
+            asyncio.create_task(
+                self._reader_loop(),
+                name=(
+                    "AsyncDataPackageReader"
+                )
+            )
         )
 
         return True
 
-    async def stop(self):
+    async def stop(
+        self
+    ) -> bool:
 
         self._running = False
 
@@ -81,28 +195,42 @@ class AsyncDataPackage:
             self._reader_task.cancel()
 
             try:
-                await self._reader_task
-            except asyncio.CancelledError:
+
+                await (
+                    self._reader_task
+                )
+
+            except (
+                asyncio.CancelledError
+            ):
                 pass
 
         return True
 
-    # =====================================================
-    # READER
-    # =====================================================
+    def is_running(
+        self
+    ) -> bool:
 
-    async def _reader_loop(self):
+        return self._running
+
+    # -------------------------------------------------
+    # Reader
+    # -------------------------------------------------
+
+    async def _reader_loop(
+        self
+    ):
 
         while self._running:
 
             try:
 
-                async with self._lock:
-
-                    chunk = await self._read_function(
+                chunk = await (
+                    self._read_function(
                         *self._read_arguments,
-                        **self._read_keyword_arguments
+                        **self._read_kwargs
                     )
+                )
 
                 if not chunk:
 
@@ -112,90 +240,218 @@ class AsyncDataPackage:
 
                     continue
 
-                self._reception_buffer += chunk
+                self._buffer.extend(
+                    chunk
+                )
 
-                while (
-                    self.PACKAGE_DELIMITER
-                    in
-                    self._reception_buffer
+                if (
+                    len(self._buffer)
+                    >
+                    self._max_buffer_size
                 ):
 
-                    raw_packet, self._reception_buffer = (
-                        self._reception_buffer.split(
-                            self.PACKAGE_DELIMITER,
-                            1
-                        )
+                    logger.warning(
+                        "Reception buffer "
+                        "exceeded maximum "
+                        "size. Clearing."
                     )
 
-                    if raw_packet:
+                    self._buffer.clear()
 
-                        await self._process_packet(
-                            raw_packet
-                        )
+                    continue
 
-            except asyncio.CancelledError:
-                return
+                await (
+                    self._extract_packets()
+                )
+
+            except (
+                asyncio.CancelledError
+            ):
+                break
 
             except Exception:
-                traceback.print_exc()
+
+                logger.exception(
+                    "Reader loop "
+                    "exception"
+                )
 
                 await asyncio.sleep(
-                    0.05
+                    0.1
                 )
+
+    async def _extract_packets(
+        self
+    ):
+
+        while True:
+
+            position = (
+                self._buffer.find(
+                    self._delimiter
+                )
+            )
+
+            if position == -1:
+                break
+
+            packet_bytes = bytes(
+                self._buffer[
+                    :position
+                ]
+            )
+
+            del self._buffer[
+                : position
+                + len(
+                    self._delimiter
+                )
+            ]
+
+            if not packet_bytes:
+                continue
+
+            await (
+                self._process_packet(
+                    packet_bytes
+                )
+            )
 
     async def _process_packet(
         self,
-        raw_packet: bytes
+        packet_bytes: bytes
     ):
 
         try:
 
             packet = json.loads(
-                raw_packet.decode(
+                packet_bytes.decode(
                     "utf-8"
                 )
             )
 
-            await self._package_queue.put(
+        except Exception:
+
+            logger.warning(
+                "Invalid packet "
+                "received"
+            )
+
+            return
+
+        if (
+            self._backpressure_mode
+            == "block"
+        ):
+
+            await self._queue.put(
+                packet
+            )
+
+        elif (
+            self._backpressure_mode
+            == "drop"
+        ):
+
+            if self._queue.full():
+
+                logger.warning(
+                    "Queue full. "
+                    "Dropping packet."
+                )
+
+            else:
+
+                self._queue.put_nowait(
+                    packet
+                )
+
+        elif (
+            self._backpressure_mode
+            == "drop_oldest"
+        ):
+
+            if self._queue.full():
+
+                try:
+
+                    self._queue.get_nowait()
+
+                except (
+                    asyncio.QueueEmpty
+                ):
+                    pass
+
+            self._queue.put_nowait(
+                packet
+            )
+
+        await (
+            self._fire_datapackage_callbacks(
+                packet
+            )
+        )
+
+    async def _safe_callback_call(
+        self,
+        callback,
+        packet
+    ):
+
+        try:
+
+            await callback(
                 packet
             )
 
         except Exception:
-            traceback.print_exc()
 
-    # =====================================================
-    # CONFIG
-    # =====================================================
+            logger.exception(
+                "Datapackage "
+                "callback failed"
+            )
 
-    async def update_reception_parameters(
+    async def _fire_datapackage_callbacks(
         self,
-        *args,
-        **kwargs
+        packet: dict
     ):
 
-        async with self._lock:
+        callbacks = tuple(
+            self._datapackage_callbacks
+        )
 
-            self._read_arguments = args
-            self._read_keyword_arguments = kwargs
+        for callback in callbacks:
 
-        return True
+            try:
 
-    async def update_send_parameters(
-        self,
-        *args,
-        **kwargs
-    ):
+                if (
+                    asyncio
+                    .iscoroutinefunction(
+                        callback
+                    )
+                ):
 
-        async with self._lock:
+                    asyncio.create_task(
+                        self._safe_callback_call(
+                            callback,
+                            packet
+                        )
+                    )
 
-            self._write_arguments = args
-            self._write_keyword_arguments = kwargs
+                else:
 
-        return True
+                    callback(packet)
 
-    # =====================================================
-    # SEND
-    # =====================================================
+            except Exception:
+
+                logger.exception(
+                    "Datapackage "
+                    "callback failed"
+                )
+
+    # -------------------------------------------------
+    # Send
+    # -------------------------------------------------
 
     async def send_datapackage(
         self,
@@ -206,53 +462,184 @@ class AsyncDataPackage:
 
             payload = (
                 json.dumps(
-                    datapackage
+                    datapackage,
+                    separators=(
+                        ",",
+                        ":"
+                    ),
+                    ensure_ascii=False
                 ).encode(
                     "utf-8"
                 )
                 +
-                self.PACKAGE_DELIMITER
-            )
-
-            return await self._write_function(
-                payload,
-                *self._write_arguments,
-                **self._write_keyword_arguments
+                self._delimiter
             )
 
         except Exception:
 
-            traceback.print_exc()
+            logger.exception(
+                "Serialization error"
+            )
 
             return False
 
-    # =====================================================
-    # RECEIVE
-    # =====================================================
+        try:
+
+            return bool(
+                await (
+                    self._write_function(
+                        payload,
+                        *self._write_arguments,
+                        **self._write_kwargs
+                    )
+                )
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Write error"
+            )
+
+            return False
+
+
+    # -------------------------------------------------
+    # Receive
+    # -------------------------------------------------
 
     async def receive_datapackage(
         self,
-        timeout: Optional[float] = None
+        timeout: Optional[
+            float
+        ] = None
     ):
 
         try:
 
             if timeout is None:
 
-                return await self._package_queue.get()
+                return await (
+                    self._queue.get()
+                )
 
-            return await asyncio.wait_for(
-                self._package_queue.get(),
-                timeout
+            return await (
+                asyncio.wait_for(
+                    self._queue.get(),
+                    timeout
+                )
             )
 
-        except asyncio.TimeoutError:
+        except (
+            asyncio.TimeoutError
+        ):
+
             return None
 
-    # =====================================================
-    # QUERIES
-    # =====================================================
+    # -------------------------------------------------
+    # Dynamic configuration
+    # -------------------------------------------------
 
-    def pending_packages(self):
+    def update_read_parameters(
+        self,
+        *args,
+        **kwargs
+    ):
 
-        return self._package_queue.qsize()
+        self._read_arguments = args
+        self._read_kwargs = kwargs
+
+    def update_write_parameters(
+        self,
+        *args,
+        **kwargs
+    ):
+
+        self._write_arguments = args
+        self._write_kwargs = kwargs
+
+    # -------------------------------------------------
+    # Utilities
+    # -------------------------------------------------
+
+    def pending_packages(
+        self
+    ) -> int:
+
+        return (
+            self._queue.qsize()
+        )
+
+    async def drain_queue(
+        self
+    ):
+
+        packets = []
+
+        while True:
+
+            try:
+
+                packets.append(
+                    self._queue.get_nowait()
+                )
+
+            except (
+                asyncio.QueueEmpty
+            ):
+                break
+
+        return packets
+
+    # -------------------------------------------------
+    # Callbacks
+    # -------------------------------------------------
+
+    def on_datapackage_receive(
+        self,
+        callback
+    ):
+
+        if not callable(
+            callback
+        ):
+
+            raise TypeError(
+                "callback must "
+                "be callable"
+            )
+
+        if callback not in (
+            self._datapackage_callbacks
+        ):
+
+            self._datapackage_callbacks.append(
+                callback
+            )
+
+        return True
+
+    def remove_datapackage_callback(
+        self,
+        callback
+    ):
+
+        try:
+
+            self._datapackage_callbacks.remove(
+                callback
+            )
+
+            return True
+
+        except ValueError:
+
+            return False
+
+    def clear_datapackage_callbacks(
+        self
+    ):
+
+        self._datapackage_callbacks.clear()
+
+        return True

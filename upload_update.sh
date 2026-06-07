@@ -73,3 +73,13 @@ echo "Version : $NEW_VERSION"
 echo "PyPI    : https://pypi.org/project/${PROJECT_NAME}/"
 echo "GitHub  : https://github.com/specter327/asyncdatapackage"
 echo
+
+echo "=================================="
+echo "UNINSTALLING PREVIOUS LIBRARY VERSION"
+echo "=================================="
+echo
+pip uninstall asyncdatapackage --break-system-packages
+sleep 10
+pip install asyncdatapackage --break-system-packages
+echo
+echo "SCRIPT FINISHED"
