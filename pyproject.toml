@@ -7,7 +7,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "asyncdatapackage"
-version = "0.1.8"
+version = "0.1.9"
 
 description = "Asynchronous datapackage serializer and transport layer"
 readme = "README.md"

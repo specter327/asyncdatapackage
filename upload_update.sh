@@ -78,8 +78,11 @@ echo "=================================="
 echo "UNINSTALLING PREVIOUS LIBRARY VERSION"
 echo "=================================="
 echo
+CWD="$(pwd)";
+cd ..;
 pip uninstall asyncdatapackage --break-system-packages
 sleep 10
 pip install asyncdatapackage --break-system-packages
 echo
+cd $CWD;
 echo "SCRIPT FINISHED"
