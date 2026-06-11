@@ -488,8 +488,8 @@ class AsyncDataPackage:
             return bool(
                 await (
                     self._write_function(
-                        payload,
                         *self._write_arguments,
+                        payload,
                         **self._write_kwargs
                     )
                 )
